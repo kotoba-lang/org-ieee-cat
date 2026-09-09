@@ -38,6 +38,27 @@
 (defn slurp-file [path :string] :string
   (typed-cap-call :fs/app-data :string :string path))
 
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; Is PATH a file this command may read? Wire 35's EXISTS form answers "1" or
+;; "0"; a path outside the granted scope answers "0", which is what the read
+;; form would trap on.
+;;
+;; This has to be ASKED. The read form TRAPS on a path it cannot serve, and a
+;; trap cannot be caught, so there is no way to notice afterwards.
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+;; A one-byte "\n", cut from a two-line literal: Kotoba source cannot write a
+;; control character and has no char-to-string builtin.
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+
 (defn digit-text [d :i64] :string
   (string-substring "0123456789" d (+ d 1)))
 
@@ -52,12 +73,28 @@
 ;; as decimal text and the guest has no text->number builtin. It does not
 ;; stop at the first empty answer: an empty ARGUMENT is legal and an empty
 ;; FILE reads as the empty string, so either would end the loop early.
-(defn walk [i :i64 total :string] :i64
+;; `cat: PATH: No such file or directory`, exit 1. Measured against /bin/cat
+;; 2026-09-10 -- each utility words this differently, so none of them is
+;; assumed from another: wc inserts `open:`, sort omits the path entirely,
+;; and sort and grep exit 2 where these exit 1.
+(defn complain [path :string] :i64
+  (do
+    (emit-error "cat: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; The check is per OPERAND and the walk continues past a bad one, because
+;; that is what cat does: `cat good missing good` prints both good files and
+;; complains once. The worst answer is remembered rather than returned early.
+(defn walk [i :i64 total :string worst :i64] :i64
   (if (string=? (decimal-of i) total)
-    0
-    (do
-      (emit (slurp-file (arg (decimal-of i))))
-      (walk (+ i 1) total))))
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (do (emit (slurp-file path)) (walk (+ i 1) total worst))
+        (walk (+ i 1) total (complain path))))))
 
 (defn main [] :i64
-  (walk 0 (arg "")))
+  (walk 0 (arg "") 0))

@@ -71,7 +71,11 @@
    ["a.txt" "empty.txt"]
    ["nonl.txt"]
    ["nonl.txt" "a.txt"]
-   ["utf8.txt"]])
+   ["utf8.txt"]
+   ;; A MISSING operand: matched on stderr and exit status since wire 35
+   ;; gained an EXISTS form. Every utility words this differently --
+   ;; measured on each, not copied from a sibling.
+   ["missing"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -86,7 +90,7 @@
         blob (.join path tmp "cat.bin")
         exe (.join path tmp "cat")
         exe-big (.join path tmp "cat-big")]
-    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38]}}" "utf8")
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
     ;; The fixtures live in the tree the binary is packaged for. The native
     ;; loader refuses a relative request outright, so operands are absolute.
     (let [data (.join path tmp "data")]
@@ -109,7 +113,7 @@
       ;; that the bound is the arena and that it moves.
       (doseq [[out extra] [[exe []] [exe-big ["--string-pool" "4000000"]]]]
         (let [p (run "nbb" (into [packager "--code" blob "--offset" offset "--isa" "aarch64"
-                                  "--allow" "35,37,38"
+                                  "--allow" "35,37,38,39"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                   "--output" out]
                                  extra) {})]
@@ -121,6 +125,10 @@
                   k (run exe argv {})
                   s (run system-cat argv {})
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             ;; stderr too: a missing operand differs there
+                             ;; and nowhere else, so a suite that compared
+                             ;; only stdout and status would call it green.
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
                              (= (:status k) (:status s)))]
               {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
