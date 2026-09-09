@@ -1,0 +1,63 @@
+;; cat -- POSIX cat (IEEE Std 1003.1) as a Kotoba command.
+;;
+;; Writes the contents of each operand to standard output, in order. With no
+;; operands POSIX reads standard input; there is no stdin capability, so this
+;; implementation writes nothing and answers 0 -- see the README, which says
+;; so rather than pretending the case is handled.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37). The
+;; filesystem scope is a constant of the packaged binary, so `./cat` reads
+;; exactly the tree it was packaged for and the caller cannot widen it.
+;;
+;; ## The size it works at, and why it is not the file API
+;;
+;; A native guest's strings live in one 65,536-byte arena in the loader that
+;; is a bump allocator and never reclaims. Reading a file puts its whole
+;; content there, so the ceiling is not "how big a file can be read" but
+;; "how many bytes this process ever allocates". Measured by bisection
+;; 2026-09-09, reading one file and writing it:
+;;
+;;   operand path 127 bytes -> largest file 65,404
+;;   operand path 178 bytes -> largest file 65,353
+;;
+;; The ceiling falls by exactly the 51 bytes the path grew, and in both cases
+;; path + file = 65,531, with the remaining 5 the decimal count :io/write
+;; answers. So the model is closed: everything this process allocates has to
+;; fit in the arena, and the operands are part of it.
+;;
+;; With SEVERAL operands the contents share that one budget, which is why
+;; this does not stream: there is nothing to stream into.
+(ns cat.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; Write each operand's contents in order. The loop counts UP and compares
+;; the RENDERED index against the rendered count, because the count arrives
+;; as decimal text and the guest has no text->number builtin. It does not
+;; stop at the first empty answer: an empty ARGUMENT is legal and an empty
+;; FILE reads as the empty string, so either would end the loop early.
+(defn walk [i :i64 total :string] :i64
+  (if (string=? (decimal-of i) total)
+    0
+    (do
+      (emit (slurp-file (arg (decimal-of i))))
+      (walk (+ i 1) total))))
+
+(defn main [] :i64
+  (walk 0 (arg "")))

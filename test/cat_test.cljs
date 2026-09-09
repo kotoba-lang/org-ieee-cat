@@ -1,0 +1,178 @@
+;; test/cat_test.cljs — build the command and compare it with the system
+;; cat, byte for byte.
+;;
+;; This does not assert that the guest COMPILES. It compiles it, packages it
+;; into a standalone binary, runs that binary, and compares its bytes and its
+;; exit status against /bin/cat -- because `:ok true` from a compiler means
+;; the artifact was built, not that it is right, and this repository's whole
+;; claim is about what the artifact does.
+;;
+;; Every case is passed as an ARGUMENT VECTOR, never through a shell. zsh does
+;; not word-split an unquoted variable, so `cmd $args` hands the whole string
+;; over as ONE argument -- which silently turns a multi-argument test into a
+;; single-argument one and makes the join logic and `-n` look tested when they
+;; are not. Measured 2026-09-09: exactly that mistake made `-n hi` and
+;; `a b c d e` pass before either was implemented or exercised.
+;;
+;;   AMU_HOME=<amu checkout> nbb test/echo_test.cljs
+;;
+;; Exits 0 when every case matches, 1 on any difference, and 2 when it could
+;; not run at all -- a distinct code, so "did not run" is never read as "ran
+;; and found nothing".
+(ns cat-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      (clj->js (merge {:encoding "buffer"} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-cat "/bin/cat")
+
+;; A directory of fixtures, and the cases over them. Each case is an argv,
+;; and each is here because it separates a right implementation from a wrong
+;; one that passes the others:
+;;
+;;   one file           -- the basic contract
+;;   two files          -- concatenated in ORDER, with nothing added between
+;;   the same file twice-- an operand is not deduplicated
+;;   an EMPTY file      -- reads as the empty string, which must not end the
+;;                         loop the way "past the last operand" does
+;;   empty then content -- the same trap from the other side
+;;   no trailing newline-- cat adds nothing of its own
+;;   binary-ish bytes   -- high bytes survive the round trip
+;;   no operands        -- POSIX reads stdin; there is no stdin capability,
+;;                         so this asserts what it ACTUALLY does (nothing),
+;;                         not what POSIX says
+(def fixtures
+  {"a.txt"      "alpha\n"
+   "b.txt"      "beta\n"
+   "empty.txt"  ""
+   "nonl.txt"   "no trailing newline"
+   "utf8.txt"   "\u65e5\u672c\u8a9e \u00e9 \ud834\udd1e\n"})
+
+(def cases
+  [["a.txt"]
+   ["a.txt" "b.txt"]
+   ["a.txt" "a.txt"]
+   ["empty.txt"]
+   ["empty.txt" "a.txt"]
+   ["a.txt" "empty.txt"]
+   ["nonl.txt"]
+   ["nonl.txt" "a.txt"]
+   ["utf8.txt"]])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      packager (.join path amu-home "scripts" "package-command.cljs")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-cat) (refuse (str "no " system-cat " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-cat-"))
+        src (.resolve path (.cwd js/process) "cat" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "cat.kexe")
+        blob (.join path tmp "cat.bin")
+        exe (.join path tmp "cat")
+        exe-big (.join path tmp "cat-big")]
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38]}}" "utf8")
+    ;; The fixtures live in the tree the binary is packaged for. The native
+    ;; loader refuses a relative request outright, so operands are absolute.
+    (let [data (.join path tmp "data")]
+      (.mkdirSync fs data)
+      (doseq [[name content] fixtures]
+        (.writeFileSync fs (.join path data name) content "utf8")))
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      ;; TWO binaries from the same code: one with the loader's default
+      ;; string-arena budget and one with a raised budget. The pair is what
+      ;; makes the ceiling below a measurement instead of a claim -- a single
+      ;; binary could only show that some size works and some does not, not
+      ;; that the bound is the arena and that it moves.
+      (doseq [[out extra] [[exe []] [exe-big ["--string-pool" "4000000"]]]]
+        (let [p (run "nbb" (into [packager "--code" blob "--offset" offset "--isa" "aarch64"
+                                  "--allow" "35,37,38"
+                                  "--fs-scope" (.realpathSync fs (.join path tmp "data"))
+                                  "--output" out]
+                                 extra) {})]
+          (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p))))))))
+    ;; Now the only thing that matters: run it.
+    (let [results
+          (for [names cases]
+            (let [argv (mapv #(.join path (.realpathSync fs (.join path tmp "data")) %) names)
+                  k (run exe argv {})
+                  s (run system-cat argv {})
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             (= (:status k) (:status s)))]
+              {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
+               :system (.toString (:out s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ")
+                      (pr-str (:argv r))
+                      " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r) (str " but " system-cat " says " (pr-str (:system r))
+                                             " exits " (pr-str (:exit r))))))) 
+      ;; The ceiling, measured on both binaries rather than described.
+      ;;
+      ;; A native guest's strings live in one arena in the loader that is a
+      ;; bump allocator and never reclaims, so what bounds `cat` is not how
+      ;; big one file may be but how many bytes the run ever allocates --
+      ;; the operand paths included. The default budget is 65,536; a binary
+      ;; packaged with --string-pool 4000000 has the same code and a bigger
+      ;; arena, and that pair is the evidence.
+      (let [big (.join path (.realpathSync fs (.join path tmp "data")) "big.txt")
+            write-n (fn [n] (.writeFileSync fs big (.repeat "x" n) "utf8"))
+            wrote (fn [exe] (let [r (run exe [big] {})]
+                              {:bytes (.-length (:out r))
+                               :trapped? (str/includes? (.toString (:err r) "utf8") "TRAP")}))
+            ;; Bisect the default binary's ceiling instead of asserting a
+            ;; number: the limit shifts with the operand path length, which
+            ;; is exactly what says the bound is the arena.
+            ceiling (loop [lo 1000 hi 200000]
+                      (if (<= (- hi lo) 1)
+                        lo
+                        (let [mid (quot (+ lo hi) 2)]
+                          (write-n mid)
+                          (if (:trapped? (wrote exe)) (recur lo mid) (recur mid hi)))))
+            _ (write-n (inc ceiling))
+            one-past (wrote exe)
+            _ (write-n 900000)
+            big-ok (wrote exe-big)
+            _ (write-n 900000)
+            big-on-small (wrote exe)
+            checks [["the default budget has a ceiling under 100 KiB" (< ceiling 100000)]
+                    ["one byte past it traps" (:trapped? one-past)]
+                    ["a 900,000-byte file is refused by the default binary"
+                     (:trapped? big-on-small)]
+                    ["and written in full by the --string-pool 4000000 binary"
+                     (and (not (:trapped? big-ok)) (= 900000 (:bytes big-ok)))]]
+            failed (remove second checks)]
+        (println (str "  ceiling of the default-budget binary, bisected: " ceiling
+                      " bytes (operand path " (count big) " bytes; "
+                      (+ ceiling (count big)) " together)"))
+        (doseq [[why ok?] checks]
+          (println (str (if ok? "  ok   " "  FAIL ") why)))
+        (println (pr-str {:ok (and (empty? bad) (empty? failed))
+                          :cases (count results) :failed (count bad)
+                          :ceiling ceiling :ceiling-checks-failed (count failed)}))
+        (.exit js/process (if (or (seq bad) (seq failed)) 1 0))))))
