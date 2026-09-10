@@ -74,6 +74,41 @@ nbb <amu>/scripts/package-command.cljs ... --string-pool 4000000 --output ./cat
 is baked at packaging time, so `./cat` reads exactly the tree it was packaged
 for and the caller cannot widen it.
 
+## Flags: `-n`, `-b`, `-s`
+
+```
+-n   number every line          "     1\tone"   (six columns, then a TAB)
+-b   number only NON-blank lines; a blank line gets no number and no tab
+-s   squeeze runs of blank lines to one
+```
+
+One flag at a time; combining them is out of scope.
+
+### The counter restarts per operand
+
+Measured on `/bin/cat` (BSD): `cat -n pair pair` answers `1 2 1 2`, **not**
+`1 2 3 4`. GNU `cat` numbers continuously, so this is a place the two
+genuinely disagree and the comparison is against the one on this machine.
+
+The control is exact: threading the count across files — the GNU behaviour —
+fails **only** the four multi-operand numbering cases and nothing else.
+Numbering blank lines under `-b` fails exactly the two `-b` cases that have
+blank lines.
+
+`-n` adds no trailing newline of its own: over a file holding `x` it answers
+`     1\tx` with no terminator.
+
+### The flags cost fuel, and the default budget cannot pay it
+
+Plain `cat` is one host call per FILE. Numbering is per LINE, and at the
+default 512 fuel `-n` over eight lines across two files exhausted it and
+**trapped** — exit 120, output truncated mid-stream. That read as a missing
+trailing newline until the exit status was looked at, which is why the suite
+compares status and not just bytes.
+
+The test now packages with raised fuel and the **default string pool**, so the
+ceiling measurement below still measures the pool it names.
+
 ## What this is not
 
 With **no operands** POSIX reads standard input. There is no stdin

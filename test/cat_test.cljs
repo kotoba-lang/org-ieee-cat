@@ -55,6 +55,15 @@
 ;;   no operands        -- POSIX reads stdin; there is no stdin capability,
 ;;                         so this asserts what it ACTUALLY does (nothing),
 ;;                         not what POSIX says
+(def flag-fixtures
+  {;; runs of blank lines, for -s and for -b's "blank lines get no number"
+   "runs"   "one\n\n\n\ntwo\nthree\n"
+   "pair"   "a\nb\n"
+   ;; no trailing newline: cat -n must not add one
+   "bare"   "x"
+   ;; a file that is nothing but blank lines
+   "allnl"  "\n\n\n"})
+
 (def fixtures
   {"a.txt"      "alpha\n"
    "b.txt"      "beta\n"
@@ -75,7 +84,25 @@
    ;; A MISSING operand: matched on stderr and exit status since wire 35
    ;; gained an EXISTS form. Every utility words this differently --
    ;; measured on each, not copied from a sibling.
-   ["missing"]])
+   ["missing"]
+   ;; --- flags ----------------------------------------------------------
+   ;; -n numbers EVERY line, -b only non-blank ones, -s squeezes runs of
+   ;; blank lines to one. `runs` holds a run of three.
+   ["-n" "runs"] ["-b" "runs"] ["-s" "runs"]
+   ;; A file that is nothing but blank lines, which -s collapses to one and
+   ;; -b numbers not at all.
+   ["-n" "allnl"] ["-b" "allnl"] ["-s" "allnl"]
+   ;; The counter RESTARTS per operand on BSD cat: `-n pair pair` is
+   ;; 1 2 1 2, not 1 2 3 4. An implementation that carried the count across
+   ;; files passes every single-operand case and fails these.
+   ["-n" "pair" "pair"] ["-b" "pair" "pair"] ["-n" "pair" "runs"]
+   ;; No trailing newline: cat -n adds none.
+   ["-n" "bare"] ["-b" "bare"] ["-s" "bare"]
+   ["-n" "bare" "pair"]
+   ;; An empty file under each flag.
+   ["-n" "empty"] ["-s" "empty"]
+   ;; A missing operand with a flag, and the flag with no operand at all.
+   ["-n" "missing"] ["-n"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -95,7 +122,7 @@
     ;; loader refuses a relative request outright, so operands are absolute.
     (let [data (.join path tmp "data")]
       (.mkdirSync fs data)
-      (doseq [[name content] fixtures]
+      (doseq [[name content] (merge fixtures flag-fixtures)]
         (.writeFileSync fs (.join path data name) content "utf8")))
     (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
                          "--policy" policy "--output" kexe] {})]
@@ -111,7 +138,14 @@
       ;; makes the ceiling below a measurement instead of a claim -- a single
       ;; binary could only show that some size works and some does not, not
       ;; that the bound is the arena and that it moves.
-      (doseq [[out extra] [[exe []] [exe-big ["--string-pool" "4000000"]]]]
+      ;; `exe` keeps the DEFAULT string pool, because the ceiling test below
+      ;; measures exactly that -- but its fuel is raised, because the flags
+      ;; are per-LINE work where plain cat is per-FILE. At the default 512,
+      ;; `-n` over eight lines across two files exhausted fuel and trapped
+      ;; (exit 120) with the output truncated mid-stream, which read as a
+      ;; missing trailing newline until the exit status was looked at.
+      (doseq [[out extra] [[exe ["--fuel" "50000000"]]
+                           [exe-big ["--fuel" "50000000" "--string-pool" "4000000"]]]]
         (let [p (run "nbb" (into [packager "--code" blob "--offset" offset "--isa" "aarch64"
                                   "--allow" "35,37,38,39"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
@@ -121,7 +155,17 @@
     ;; Now the only thing that matters: run it.
     (let [results
           (for [names cases]
-            (let [argv (mapv #(.join path (.realpathSync fs (.join path tmp "data")) %) names)
+            ;; A leading `-` is a FLAG and passes through verbatim; only real
+            ;; operands become paths. Mapping everything would hand `-n` to the
+            ;; filesystem: both implementations would then fail on the same
+            ;; nonexistent path and agree, and every flag case would be green
+            ;; without one flag executing. That exact shape made 72 cases
+            ;; vacuous in org-ieee-sort, which is why it is guarded here
+            ;; before the first run rather than after.
+            (let [argv (mapv #(if (str/starts-with? % "-")
+                                %
+                                (.join path (.realpathSync fs (.join path tmp "data")) %))
+                             names)
                   k (run exe argv {})
                   s (run system-cat argv {})
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
