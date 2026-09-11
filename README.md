@@ -18,7 +18,7 @@ binary, **runs that binary**, and compares bytes and exit status against
 that it is right.
 
 ```
-AMU_HOME=<amu checkout> nbb test/cat_test.cljk
+AMU_HOME=<amu checkout> kbb --backend sci test/cat_test.cljk
 ```
 
 Nine cases, all byte-identical. Each separates a right implementation from a
