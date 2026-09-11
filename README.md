@@ -12,13 +12,13 @@ same `org-<body>-<spec>` pattern as
 
 ## Measured against the system utility
 
-`test/cat_test.cljs` compiles the guest, packages it into a standalone
+`test/cat_test.cljk` compiles the guest, packages it into a standalone
 binary, **runs that binary**, and compares bytes and exit status against
 `/bin/cat` — `:ok true` from a compiler means the artifact was built, not
 that it is right.
 
 ```
-AMU_HOME=<amu checkout> nbb test/cat_test.cljs
+AMU_HOME=<amu checkout> nbb test/cat_test.cljk
 ```
 
 Nine cases, all byte-identical. Each separates a right implementation from a
